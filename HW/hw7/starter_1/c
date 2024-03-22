@@ -1,0 +1,262 @@
+#include "cashier.h"
+#include <assert.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+int log_2(int x) {
+	/* Function for compute log_2 for 2^n */
+	int ret = 0;
+	while (x >>= 1) ret++;
+	return ret;
+}
+
+void show_in_bits(uint64_t x){
+	// Show a uint64 in bits
+	for(int i = 0;i < 64; i++){
+		if(i && (i % 4 == 0)) printf(" ");
+		// 4 bit 1 space
+		printf("%ld", (x >> (63-i)) & 1);
+	}
+	puts("");
+}
+
+struct cashier* cashier_init(struct cache_config config) {
+	// YOUR CODE HERE
+	// Malloc Space for New Cache
+	struct cashier* cache = (struct cashier*)malloc(sizeof(struct cashier));
+	// Return NULL for allocation failure
+	if (cache == NULL) return NULL;
+	// Set the config
+	cache->config = config;
+	// Set the size
+	cache->size = config.line_size * config.lines;
+	// Set tag, index, offset parameters
+	cache->offset_bits = log_2(config.line_size);
+	cache->index_bits = log_2(config.lines / config.ways);
+	cache->tag_bits = config.address_bits - cache->offset_bits - cache->index_bits;
+	//printf("Line size: %lu, Lines: %lu, Ways: %lu\n", config.line_size, config.lines, config.ways);
+	//printf("Tag bits: %lu, Index bits: %lu, Offset: %lu\n", cache->tag_bits, cache->index_bits, cache->offset_bits);
+	// Generate the masks
+	cache->offset_mask = (1 << cache->offset_bits) - 1;
+	//puts("Offset Mask");
+	//show_in_bits(cache->offset_mask);
+	cache->index_mask = ((1 << cache->index_bits) - 1) << cache->offset_bits;
+	//puts("Index Mask");
+	//show_in_bits(cache->index_mask);
+	cache->tag_mask = ((1 << cache->tag_bits) - 1) << (cache->offset_bits + cache->index_bits);
+	//puts("Tag Mask");
+	//show_in_bits(cache->tag_mask);
+	// Malloc Space for Cache Lines
+	cache->lines = (struct cache_line*)malloc(sizeof(struct cache_line) * config.lines);
+	// Return NULL for allocation failure
+	// if (cache->lines == NULL) {
+	// 	return NULL;
+	// }
+	// Initialize the cache lines
+	for (uint64_t i = 0; i < config.lines; i++){
+		// New cacheline should be invalid
+		cache->lines[i].valid = false; 
+		// New cacheline should be clean
+		cache->lines[i].dirty = false;
+		// New cacheline should have tag 0
+		cache->lines[i].tag = 0;
+		// New cacheline should have last_access 0
+		cache->lines[i].last_access = 0;
+		// Datas in thie cache line
+		cache->lines[i].data = (uint8_t*)malloc(sizeof(uint8_t) * cache->config.line_size);
+		// Maybe need to Check for NULL
+	}
+	return cache;
+}
+
+void cashier_release(struct cashier* cache) {
+	// YOUR CODE HERE
+	uint64_t ways = cache->config.ways, set_count = cache->config.lines / ways;
+	printf("Ways: %lu, Set Count: %lu\n", ways, set_count);
+	// for(uint64_t i = 0; i < cache->config.lines; i++){
+	for(uint64_t i = 0; i < ways; i++){
+		for(uint64_t j = 0; j < set_count; j++){
+			uint64_t index = j * ways + i;
+			//printf("Index: %lu\n", index);
+			if(cache->lines[index].valid){
+				// All data be treat evicted 
+				before_eviction(j ,cache->lines + index);
+				// Write Data because eviction
+				uint64_t addr = 0;
+				addr |= (cache->lines[index].tag << (cache->index_bits + cache->offset_bits));
+				addr |= (j << cache->offset_bits);
+				printf("Address = %lx\n", addr);
+				if(cache->lines[index].dirty){
+					for(uint64_t k = 0; k < cache->config.line_size; k++){
+						//printf("Eviction: Write %d to %lx\n", cache->lines[index].data[k], addr + k);
+						mem_write(addr + k, cache->lines[index].data[k] );	
+					}					
+				}
+			}
+			free(cache->lines[index].data);
+		}
+	}
+	// Free the lines
+	free(cache->lines);
+	free(cache);
+}
+
+
+
+bool cashier_read(struct cashier* cache, uint64_t addr, uint8_t* byte) {
+	// YOUR CODE HERE
+	uint64_t ways = cache->config.ways, set_count = cache->config.lines / ways;
+	// Get tag, index and offset
+	uint64_t tag = (addr & cache->tag_mask) >> (cache->index_bits + cache->offset_bits);
+	uint64_t index = (addr & cache->index_mask) >> (cache->offset_bits);
+	uint64_t offset = addr& cache->offset_mask;
+	// Check for lines
+	uint64_t set_index = index, set_base_cache = set_index * ways;
+	for(uint64_t i = set_base_cache; i < set_base_cache + ways; i ++){
+		if(cache->lines[i].valid && cache->lines[i].tag == tag){
+			//cache->lines[i].dirty = false;
+			// Read
+			*byte = cache->lines[i].data[offset];
+			cache->lines[i].last_access = get_timestamp();
+			return true;
+		}
+	}
+	// For cache miss
+	// Firstly find Invalid Space
+	uint64_t min_id = set_base_cache, min_time = cache->lines[min_id].last_access;
+	for(uint64_t i = set_base_cache; i < set_base_cache + ways; i ++){
+		//printf("Index = %ld, i = %ld\n", index, i);
+		if(!cache->lines[i].valid){
+			// Find a new space!
+			cache->lines[i].valid = true;
+			// Write back policy!
+			cache->lines[i].dirty = false;
+			// Read data from memory
+			uint64_t base_addr = addr & ~(cache->offset_mask);
+			for(uint64_t j = 0; j < cache->config.line_size; j++){
+				cache->lines[i].data[j] = mem_read(base_addr + j);
+			}
+			*byte = cache->lines[i].data[offset];
+			// Set datas
+			cache->lines[i].last_access = get_timestamp();
+			cache->lines[i].tag = tag;
+			// But also Cache miss
+			return false;
+		}
+		if(cache->lines[i].last_access < min_time){
+			min_id = i;
+			min_time = cache->lines[i].last_access;
+		}
+	}
+	
+	// evict the cache min_id
+	uint64_t evict_addr = 0;
+	evict_addr |= (cache->lines[min_id].tag) << (cache->index_bits + cache->offset_bits);
+	evict_addr |= (index << cache->offset_bits);
+	uint64_t evi_set_index = set_index;
+	before_eviction(evi_set_index, cache->lines + min_id);
+	// printf("Dirty = %d\n", cache->lines[min_id].dirty);
+	// printf("Min_id = %ld\n", min_id);
+	// Check for dirty bits
+	if(cache->lines[min_id].dirty){
+		for(uint64_t j = 0; j < cache->config.line_size; j++){
+			///printf("???\n");
+			mem_write(evict_addr + j, cache->lines[min_id].data[j]);
+		}
+	}
+	// Find a new space!
+	cache->lines[min_id].valid = true;
+	// Write back policy!
+	cache->lines[min_id].dirty = false;
+	// Read data from memory
+	//cache->lines[min_id].data[offset] = mem_read(addr);
+	//printf("Data = %d\n", mem_read(addr));
+	uint64_t base_addr = addr & ~(cache->offset_mask);
+	for(uint64_t j = 0; j < cache->config.line_size; j++){
+		cache->lines[min_id].data[j] = mem_read(base_addr + j);
+	}
+	// Then read data
+	*byte = cache->lines[min_id].data[offset];
+	cache->lines[min_id].last_access = get_timestamp();
+	cache->lines[min_id].tag = tag;
+	return false;
+}
+
+bool cashier_write(struct cashier* cache, uint64_t addr, uint8_t byte) {
+	// YOUR CODE HERE
+	//puts("===========================================");
+	//puts("Write Operation");
+	//puts("Address:");
+	//show_in_bits(addr);
+	uint64_t ways = cache->config.ways, set_count = cache->config.lines / ways;
+	uint64_t tag = (addr & cache->tag_mask) >> (cache->index_bits + cache->offset_bits);
+	uint64_t index = (addr & cache->index_mask) >> (cache->offset_bits);
+	uint64_t offset = addr & cache->offset_mask;
+	// Check for tags
+	uint64_t set_index = index, set_base_cache = set_index * ways;
+	for(uint64_t i = set_base_cache; i < set_base_cache + ways; i ++){
+		if(cache->lines[i].valid && cache->lines[i].tag == tag){
+			// Cache Hit!
+			// Set Dirty Bit!
+			//printf("VALUE = %d\n", byte);
+			cache->lines[i].dirty = true;
+			cache->lines[i].data[offset] = byte;
+			cache->lines[i].last_access = get_timestamp();
+			return true;
+		}
+	}
+	//puts("=================CACHE MISS===================");
+	// Cache Miss!
+	// Firstly find Invalid Space
+	uint64_t min_id = set_base_cache, min_time = cache->lines[min_id].last_access;
+	for(uint64_t i = set_base_cache; i < set_base_cache + ways; i ++){
+		// Find Invalid
+		if(!cache->lines[i].valid){
+			// Find a new space!
+			cache->lines[i].valid = true;
+			// Write back policy!
+			cache->lines[i].dirty = true;
+			// Get Base Address
+			uint64_t base_addr = addr & ~(cache->offset_mask);
+			for(uint64_t j = 0; j < cache->config.line_size; j++){
+				cache->lines[i].data[j] = mem_read(base_addr + j);
+			}
+			cache->lines[i].data[offset] = byte;
+			cache->lines[i].last_access = get_timestamp();
+			cache->lines[i].tag = tag;
+			// But also Cache miss
+			return false;
+		}
+		if(cache->lines[i].last_access < min_time){
+			min_id = i;
+			min_time = cache->lines[i].last_access;
+		}
+	}
+	// evict the cache min_id
+	uint64_t evict_addr = 0;
+	evict_addr |= (cache->lines[min_id].tag) << (cache->index_bits + cache->offset_bits);
+	evict_addr |= index << cache->offset_bits;
+	uint64_t evi_set_index = set_index;
+	// printf("Dirty = %d\n", cache->lines[min_id].dirty);
+	before_eviction(evi_set_index, cache->lines + min_id);
+	// Check for dirty bits
+	
+	if(cache->lines[min_id].dirty){
+		for(uint64_t j = 0; j < cache->config.line_size; j++){
+			mem_write(evict_addr + j, cache->lines[min_id].data[j]);	
+		}
+	}
+	// Find a new space!
+	cache->lines[min_id].valid = true;
+	// Write back policy!
+	cache->lines[min_id].dirty = true;
+	uint64_t base_addr = addr & ~(cache->offset_mask);
+	for(uint64_t j = 0; j < cache->config.line_size; j++){
+		cache->lines[min_id].data[j] = mem_read(base_addr + j);
+	}
+	// Then write data
+	cache->lines[min_id].data[offset] = byte;
+	cache->lines[min_id].last_access = get_timestamp();
+	cache->lines[min_id].tag = tag;
+	return false;
+}
